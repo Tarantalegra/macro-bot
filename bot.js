@@ -27,6 +27,32 @@ const TG_CHANNEL = getEnv("TG_CHANNEL");
 
 console.log("🤖 Macro Bot запущено...");
 
+// --- Глобальний обробник помилок ---
+process.on("uncaughtException", async (err) => {
+  console.error("Uncaught exception:", err.message);
+  try {
+    await bot.sendMessage(CHAT_ID, `⚠️ Критична помилка бота:\n${err.message}\n\nБот перезапускається...`);
+  } catch {}
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+});
+
+// --- Retry: повторна спроба при помилці ---
+async function withRetry(fn, retries = 2, delay = 3000) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (retries > 0) {
+      console.log(`Помилка: ${e.message}. Повтор через ${delay / 1000}с...`);
+      await new Promise((r) => setTimeout(r, delay));
+      return withRetry(fn, retries - 1, delay);
+    }
+    throw e;
+  }
+}
+
 // --- Важливість → емодзі ---
 function impactEmoji(impact) {
   if (!impact) return "🟡";
@@ -41,7 +67,7 @@ function esc(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// --- Прибираємо markdown-зірочки з відповідей Claude ---
+// --- Прибираємо markdown з відповідей Claude ---
 function stripMd(text) {
   return String(text).replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").replace(/_/g, "").trim();
 }
@@ -71,21 +97,19 @@ async function sendSafe(chatId, header, body, options = {}) {
 
 // --- Економічний календар FinnHub ---
 async function getFinnhubEvents() {
-  const today = new Date().toISOString().split("T")[0];
-  const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
-  try {
+  return withRetry(async () => {
+    const today = new Date().toISOString().split("T")[0];
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
     const res = await axios.get("https://finnhub.io/api/v1/calendar/economic", {
       params: { from: today, to: tomorrow, token: FINNHUB_KEY },
+      timeout: 10000,
     });
     const events = res.data.economicCalendar || [];
     const relevant = ["USD", "EUR", "GBP", "JPY", "XAU", "CHF", "DE"];
     return events
       .filter((e) => relevant.some((c) => (e.country || "").includes(c) || (e.currency || "").includes(c)))
       .slice(0, 25);
-  } catch (e) {
-    console.error("FinnHub помилка:", e.message);
-    return [];
-  }
+  });
 }
 
 // --- Новини з Telegram каналу ---
@@ -114,6 +138,18 @@ async function getTelegramNews() {
       .join("\n---\n");
   } catch (e) {
     console.error("Telegram channel помилка:", e.message);
+    const isSessionError =
+      e.message.includes("AUTH_KEY") ||
+      e.message.includes("SESSION") ||
+      e.message.includes("401") ||
+      e.message.includes("session");
+    if (isSessionError) {
+      await bot.sendMessage(
+        CHAT_ID,
+        "⚠️ Telegram сесія протухла.\nПотрібна переавторизація — запусти локально:\n<code>node auth.js</code>\nПотім оновіть TG_SESSION у Fly.io secrets.",
+        { parse_mode: "HTML" }
+      );
+    }
     return "";
   }
 }
@@ -125,46 +161,46 @@ async function analyzeCalendar(events) {
   const eventsText = events.map((e) => {
     const emoji = impactEmoji(e.impact);
     const actual =
-      e.actual !== undefined && e.actual !== null && e.actual !== ""
-        ? String(e.actual)
-        : "—";
+      e.actual !== undefined && e.actual !== null && e.actual !== "" ? String(e.actual) : "—";
     const prevRevised = e.prevRevised ? ` (переглянуте: ${e.prevRevised})` : "";
     return `${emoji} [${e.time || "?"}] ${e.country || ""} — ${e.event || ""} | Важливість: ${e.impact || "?"} | Факт: ${actual} | Прогноз: ${e.estimate || "?"} | Попереднє: ${e.prev || "?"}${prevRevised}`;
   }).join("\n");
 
-  const res = await claude.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 1000,
-    messages: [{
-      role: "user",
-      content: `Ти трейдер-аналітик. Інструменти: DXY, EUR/USD, GBP/USD, XAU/USD, XAG/USD, USD/JPY, GER40.
+  const res = await withRetry(() =>
+    claude.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1000,
+      messages: [{
+        role: "user",
+        content: `Ти трейдер-аналітик. Інструменти: DXY, EUR/USD, GBP/USD, XAU/USD, XAG/USD, USD/JPY, GER40.
 
 Економічний календар на сьогодні:
 ${eventsText}
 
 Правила:
-- Показуй ВСІ події (🔴 🟠 🟡 — всі рівні важливості)
-- ФАКТ "—" означає подія ще не відбулась — в такому разі аналіз "очікується"
-- Якщо ФАКТ є — порівняй із прогнозом, напиши чи сюрприз позитивний чи негативний
-- Для Попереднього визнач тип порівняння з назви події: M/M, Q/Q або Y/Y
+- Показуй ВСІ події (🔴 🟠 🟡)
+- ФАКТ "—" = подія ще не відбулась
+- Якщо ФАКТ є — порівняй із прогнозом, скажи чи сюрприз позитивний чи негативний
+- Для Попереднього визнач тип (M/M, Q/Q, Y/Y) з назви події
 
-Для кожної виведи СТРОГО в такому форматі:
+Для кожної виведи СТРОГО:
 
 ВАЖЛИВІСТЬ: [🔴 або 🟠 або 🟡]
 ЗАГОЛОВОК: [назва події]
 ЧАС: [час із календаря]
 ФАКТ: [значення або —]
 ПРОГНОЗ: [прогнозне значення або —]
-ПОПЕРЕДНЄ: [значення і тип: напр. 185K (M/M) або 2.1% (Y/Y)]
+ПОПЕРЕДНЄ: [значення і тип: M/M або Q/Q або Y/Y]
 АНАЛІЗ: [що це означає для ринку — 1 речення]
-НАПРЯМОК: [напр. DXY ↑, Gold ↓ або — якщо невідомо]
-АКТИВИ: [перелік інструментів]
-ДЖЕРЕЛО: [BLS / Fed / ECB / Eurostat / інше]
+НАПРЯМОК: [DXY ↑ Gold ↓ або —]
+АКТИВИ: [перелік]
+ДЖЕРЕЛО: [BLS / Fed / ECB / інше]
 ---
 
 Українською. Коротко.`,
-    }],
-  });
+      }],
+    })
+  );
   return res.content[0].text;
 }
 
@@ -172,12 +208,13 @@ ${eventsText}
 async function analyzeNews(news) {
   if (!news) return "Нових повідомлень за останні 12 годин не знайдено.";
 
-  const res = await claude.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 1200,
-    messages: [{
-      role: "user",
-      content: `Ти трейдер-аналітик. Інструменти: DXY, EUR/USD, GBP/USD, XAU/USD, XAG/USD, USD/JPY, GER40.
+  const res = await withRetry(() =>
+    claude.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1200,
+      messages: [{
+        role: "user",
+        content: `Ти трейдер-аналітик. Інструменти: DXY, EUR/USD, GBP/USD, XAU/USD, XAG/USD, USD/JPY, GER40.
 
 Новини з трейдерського каналу (останні 12 годин, час у форматі [ДД.ММ ГГ:ХХ]):
 ${news}
@@ -185,18 +222,19 @@ ${news}
 Відбери тільки ринково релевантні новини. Ігноруй рекламу і нерелевантне.
 Для кожної виведи СТРОГО:
 
-ВАЖЛИВІСТЬ: [🔴 або 🟠 або 🟡 залежно від важливості для ринку]
+ВАЖЛИВІСТЬ: [🔴 або 🟠 або 🟡]
 ЗАГОЛОВОК: [коротка назва новини]
-ЧАС: [час із дужок, формат ДД.ММ ГГ:ХХ]
+ЧАС: [час із дужок, ДД.ММ ГГ:ХХ]
 ОЧІКУВАННЯ: [що очікувати від ринку — 1 речення]
-НАПРЯМОК: [напр. DXY ↑, Gold ↓ або —]
-АКТИВИ: [перелік інструментів]
-ДЖЕРЕЛО: [Bloomberg / Reuters / WSJ / Twitter / інше]
+НАПРЯМОК: [DXY ↑ Gold ↓ або —]
+АКТИВИ: [перелік]
+ДЖЕРЕЛО: [Bloomberg / Reuters / WSJ / інше]
 ---
 
 Українською.`,
-    }],
-  });
+      }],
+    })
+  );
   return res.content[0].text;
 }
 
@@ -224,7 +262,6 @@ function formatCalendarHTML(raw) {
       let out = `${importance} <b>${esc(headline)}</b>`;
       if (time) out += `  ${esc(time)}`;
       out += "\n\n";
-
       if (actual) out += `Факт: ${esc(actual)}\n`;
       if (forecast) out += `Прогноз: ${esc(forecast)}\n`;
       if (prev) out += `Попереднє: ${esc(prev)}\n`;
@@ -235,7 +272,6 @@ function formatCalendarHTML(raw) {
       ].filter(Boolean).join("  ·  ");
       if (meta) out += `${meta}\n`;
       if (source) out += `📎 ${esc(source)}`;
-
       return out;
     })
     .filter(Boolean)
@@ -270,7 +306,6 @@ function formatNewsHTML(raw) {
       ].filter(Boolean).join("  ·  ");
       if (meta) out += `${meta}\n`;
       if (source) out += `📎 ${esc(source)}`;
-
       return out;
     })
     .filter(Boolean)
@@ -304,7 +339,7 @@ const menuKeyboard = {
   reply_markup: {
     keyboard: [
       [{ text: "📊 Календар" }, { text: "📰 TSTA новини" }],
-      [{ text: "📋 Повний звіт" }],
+      [{ text: "📋 Повний звіт" }, { text: "🏓 Ping" }],
     ],
     resize_keyboard: true,
   },
@@ -326,6 +361,11 @@ bot.onText(/^\/macro(@\w+)?$/, async (msg) => {
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ " + e.message); }
 });
 
+bot.onText(/^\/ping(@\w+)?$/, async (msg) => {
+  const time = new Date().toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" });
+  await bot.sendMessage(msg.chat.id, `✅ Macro Bot живий  ${time}`);
+});
+
 bot.onText(/^\/menu(@\w+)?$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, "Оберіть дію:", menuKeyboard);
 });
@@ -336,6 +376,7 @@ bot.onText(/^\/start(@\w+)?$/, async (msg) => {
     `👋 Macro Bot активний!\n\n` +
     `/macro — економічний календар\n` +
     `/tsta — новини з @tstamarkets\n` +
+    `/ping — перевірити чи бот живий\n` +
     `/menu — відкрити меню\n\n` +
     `📅 Автозвіт щодня о 9:00 (календар + новини)`,
     menuKeyboard
@@ -351,13 +392,16 @@ bot.on("message", async (msg) => {
     else if (msg.text === "📋 Повний звіт") {
       await sendCalendar(msg.chat.id);
       await sendTSTANews(msg.chat.id);
+    } else if (msg.text === "🏓 Ping") {
+      const time = new Date().toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" });
+      await bot.sendMessage(msg.chat.id, `✅ Macro Bot живий  ${time}`);
     }
   } catch (e) {
     await bot.sendMessage(msg.chat.id, "❌ " + e.message);
   }
 });
 
-// --- Автозвіт о 9:00 Київ (06:00 UTC) — календар + новини ---
+// --- Автозвіт о 9:00 Київ (06:00 UTC) ---
 cron.schedule("0 6 * * *", async () => {
   try {
     console.log("Автозвіт: відправляю...");
@@ -365,5 +409,6 @@ cron.schedule("0 6 * * *", async () => {
     await sendTSTANews(CHAT_ID);
   } catch (e) {
     console.error("Автозвіт помилка:", e.message);
+    await bot.sendMessage(CHAT_ID, `⚠️ Автозвіт не вдався: ${e.message}`).catch(() => {});
   }
 }, { timezone: "UTC" });
