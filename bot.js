@@ -7,7 +7,7 @@ const axios = require("axios");
 const fs = require("fs");
 const http = require("http");
 
-http.createServer((req, res) => res.end("ok")).listen(8080);
+const WEBHOOK_URL = "https://gleb-macro-bot.fly.dev";
 
 function getEnv(key) {
   if (process.env[key]) return process.env[key];
@@ -19,13 +19,34 @@ function getEnv(key) {
   }
 }
 
-const bot = new TelegramBot(getEnv("TELEGRAM_TOKEN"), { polling: true });
+const TELEGRAM_TOKEN = getEnv("TELEGRAM_TOKEN");
+const bot = new TelegramBot(TELEGRAM_TOKEN, { webHook: false });
 const claude = new Anthropic({ apiKey: getEnv("ANTHROPIC_API_KEY") });
 const CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
 const FINNHUB_KEY = getEnv("FINNHUB_API_KEY");
 const TG_CHANNEL = getEnv("TG_CHANNEL");
 
-console.log("🤖 Macro Bot запущено...");
+// --- HTTP сервер: health check + webhook endpoint ---
+http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200).end("ok");
+    return;
+  }
+  if (req.method === "POST" && req.url === `/bot${TELEGRAM_TOKEN}`) {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      try { bot.processUpdate(JSON.parse(body)); } catch {}
+      res.writeHead(200).end("ok");
+    });
+    return;
+  }
+  res.writeHead(404).end();
+}).listen(8080, () => {
+  bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`)
+    .then(() => console.log("🤖 Macro Bot запущено (webhook)..."))
+    .catch((e) => console.error("Webhook error:", e.message));
+});
 
 // --- Глобальний обробник помилок ---
 process.on("uncaughtException", async (err) => {
@@ -50,18 +71,6 @@ async function notifyShutdown(signal) {
 process.on("SIGTERM", () => notifyShutdown("SIGTERM"));
 process.on("SIGINT", () => notifyShutdown("SIGINT"));
 
-// --- Помилки Telegram polling ---
-let lastPollingAlert = 0;
-bot.on("polling_error", async (err) => {
-  console.error("Polling error:", err.code, err.message);
-  const now = Date.now();
-  if (now - lastPollingAlert > 10 * 60 * 1000) {
-    lastPollingAlert = now;
-    try {
-      await bot.sendMessage(CHAT_ID, `⚠️ Macro Bot: помилка підключення до Telegram\n${err.code}: ${err.message}`);
-    } catch {}
-  }
-});
 
 // --- Retry: повторна спроба при помилці ---
 async function withRetry(fn, retries = 2, delay = 3000) {
