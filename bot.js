@@ -39,6 +39,30 @@ process.on("unhandledRejection", (reason) => {
   console.error("Unhandled rejection:", reason);
 });
 
+// --- Сигнали зупинки від Fly.io ---
+async function notifyShutdown(signal) {
+  console.log(`${signal} received`);
+  try {
+    await bot.sendMessage(CHAT_ID, `⚠️ Macro Bot зупиняється (${signal}). Fly.io перезапускає машину.`);
+  } catch {}
+  process.exit(0);
+}
+process.on("SIGTERM", () => notifyShutdown("SIGTERM"));
+process.on("SIGINT", () => notifyShutdown("SIGINT"));
+
+// --- Помилки Telegram polling ---
+let lastPollingAlert = 0;
+bot.on("polling_error", async (err) => {
+  console.error("Polling error:", err.code, err.message);
+  const now = Date.now();
+  if (now - lastPollingAlert > 10 * 60 * 1000) {
+    lastPollingAlert = now;
+    try {
+      await bot.sendMessage(CHAT_ID, `⚠️ Macro Bot: помилка підключення до Telegram\n${err.code}: ${err.message}`);
+    } catch {}
+  }
+});
+
 // --- Retry: повторна спроба при помилці ---
 async function withRetry(fn, retries = 2, delay = 3000) {
   try {
